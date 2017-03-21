@@ -28,4 +28,6 @@ dependencies {
   compile spinnaker.dependency('scheduledActionsCore')
   compile spinnaker.dependency('scheduledActionsCassandra')
   compile spinnaker.dependency('scheduledActionsWeb')
+
+  compile group: 'org.apache.kafka', name: 'kafka-clients', version: '0.10.2.0'
 }
