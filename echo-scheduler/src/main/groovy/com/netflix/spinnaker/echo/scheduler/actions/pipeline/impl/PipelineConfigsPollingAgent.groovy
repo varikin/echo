@@ -38,7 +38,7 @@ import org.springframework.stereotype.Component
 @ConditionalOnExpression('${scheduler.enabled:false} && ${scheduler.pipelineConfigsPoller.enabled:true}')
 @Slf4j
 class PipelineConfigsPollingAgent extends AbstractPollingAgent {
-  public static final String TRIGGER_TYPE = "cron";
+  public static final String TRIGGER_TYPE = "cron"
 
   private final CounterService counterService
   private final GaugeService gaugeService
