@@ -16,16 +16,19 @@
 
 package com.netflix.spinnaker.echo.scheduler.actions.pipeline.impl
 
+import com.netflix.spinnaker.echo.config.KafkaConfig
 import com.netflix.spinnaker.echo.model.Pipeline
+import com.netflix.spinnaker.echo.model.Trigger
 import com.netflix.spinnaker.echo.pipelinetriggers.PipelineCache
+import com.netflix.spinnaker.echo.pipelinetriggers.orca.PipelineInitiator
 import groovy.util.logging.Slf4j
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.actuate.metrics.GaugeService
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression
+import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.stereotype.Component
 
 /**
@@ -33,34 +36,38 @@ import org.springframework.stereotype.Component
  */
 // TODO (jcs) setup the properties
 @Component
-@ConditionalOnProperty('${kafka.enabled}')
+@ConditionalOnExpression('${kafkaConsumer.enabled:false}')
+@EnableConfigurationProperties(KafkaConfig)
 @Slf4j
 class KafkaPollingAgent extends AbstractPollingAgent {
-  public static final String TRIGGER_TYPE = "kafka"
+  public static final String TRIGGER_TYPE = Trigger.Type.KAFKA.toString()
 
   private final long intervalMs
   private final GaugeService gaugeService
   private final PipelineCache pipelineCache
+  private final PipelineInitiator pipelineInitiator
   private final Map<String, KafkaConsumer<String, String>> consumers
 
   @Autowired
   KafkaPollingAgent(GaugeService gaugeService,
                     PipelineCache pipelineCache,
-                    @Value('${kafka.pollingIntervalMs:30000') long intervalMs) {
-    this.intervalMs = intervalMs
+                    PipelineInitiator pipelineInitiator,
+                    KafkaConfig kafkaConfig) {
+    this.intervalMs = kafkaConfig.pollingIntervalMs
     this.gaugeService = gaugeService
     this.pipelineCache = pipelineCache
+    this.pipelineInitiator = pipelineInitiator
 
-    // TODO (jcs) inject servers!
-    def servers = []
-    consumers = servers.collectEntries { server ->
+    log.info("Setting up KafkaPollingAgent")
+    consumers = kafkaConfig.brokers.collectEntries { broker ->
       def config = [
-        "bootstrap.servers": server.address,
+        "bootstrap.servers": broker.address,
         "group.id": "kafka-spinnaker",
         "key.deserializer": StringDeserializer.class.getName(),
         "value.deserializer": StringDeserializer.class.getName(),
+        // TODO (jcs) set cert if exists
       ]
-      return [server.name, new KafkaConsumer<String, String>(config)]
+      return [broker.name, new KafkaConsumer<String, String>(config)]
     }
   }
 
@@ -81,32 +88,27 @@ class KafkaPollingAgent extends AbstractPollingAgent {
     try {
       log.info("Running the Kafka polling agent")
 
-      // Get pipelines that have a Kafka trigger
-      def pipelines = pipelineCache.getPipelines().findAll { pipeline ->
-        pipeline.triggers && pipeline.triggers.any { TRIGGER_TYPE.equalsIgnoreCase(it.type) }
-      }
+      Map<String, Map<String, Set<Pipeline>>> pipelines = getPipelines()
 
-      // Maps Kafka servers to a map of topics to a set of pipelines.
-      // In other words, a server has many topics, each topic has many pipelines.
-      Map<String, Map<String, Set<Pipeline>>> kafkaToPipeline =  []
-      pipelines.each { pipeline ->
-        def server = pipeline.properties['kafkaServer']
-        def topic = pipeline.properties['kafkaTopic']
-        def entry = kafkaToPipeline.get(server, [:].withDefault { new HashSet<Pipeline>() })
-        entry[topic].add(pipeline)
-      }
-
-      // TODO (jcs) subscribe
-      subscribe(kafkaToPipeline)
+      subscribe(pipelines)
 
       this.consumers.each { name, consumer ->
-        List<ConsumerRecord<String, String>> records = consumer.poll(0)
-        records.each { record ->
-          def topic = record.topic()
-          def message = record.value()
-          kafkaToPipeline.get(name).get(topic).each { pipeline ->
-            // Trigger pipeline
+        try {
+          if (consumer.listTopics().isEmpty()) {
+            log.debug("Kafka consumer ${name} is not subscribed to any topics")
+            return
           }
+          List<ConsumerRecord<String, String>> records = consumer.poll(0)
+          records.each { record ->
+            def topic = record.topic()
+            def message = record.value()
+            pipelines.get(name).get(topic).each { pipeline ->
+              def pipelineWithContext = buildPipelineWithContext(pipeline, message)
+              pipelineInitiator.call(pipelineWithContext)
+            }
+          }
+        } catch (Exception e) {
+          log.error("Exception occurred while polling Kafka server {}, continuing to the next Kafka server", name, e)
         }
       }
     } catch (Exception e) {
@@ -117,10 +119,46 @@ class KafkaPollingAgent extends AbstractPollingAgent {
   }
 
   /**
+   * Returns pipelines with with Kafka triggers.
+   *
+   * The collection is a Map of maps. The outer map is server names to a map of topics to a set of pipelines.
+   *
+   * In other words, a server has many topics, each topic has many pipelines. For example:
+   *
+   * [
+   *  production-kafka: [
+   *    application: [app-pipeline, app-pipeline-2],
+   *    app2: [app2-pipeline, app-pipeline-2]
+   *  ],
+   *  testing-kafka: [
+   *    application: [app-test-pipeline, app-test-pipeline-2],
+   *    app2: [app2-test-pipeline, app-test-pipeline-2]
+   *  ]
+   * ]
+   */
+  private Map<String, Map<String, Set<Pipeline>>> getPipelines() {
+    // Get pipelines that have a Kafka trigger
+    def pipelines = pipelineCache.getPipelines().findAll { pipeline ->
+      pipeline.triggers && pipeline.triggers.any { TRIGGER_TYPE.equalsIgnoreCase(it.type) }
+    }
+
+    // Build the map of servers to topics and pipelines
+    Map<String, Map<String, Set<Pipeline>>> kafkaToPipeline = [:]
+    pipelines.each { pipeline ->
+      def server = pipeline.properties['kafkaServer']
+      def topic = pipeline.properties['kafkaTopic']
+      def entry = kafkaToPipeline.get(server, [:].withDefault { new HashSet<Pipeline>() })
+      entry[topic].add(pipeline)
+    }
+    return kafkaToPipeline
+  }
+
+  /**
    * Subscribe to all Kafka topics specified by pipelines.
    *
    * This is an idempotent method in that it will compare the current state against the needed state.
    * Then it will resubcribe to all Kafka topics if there is a difference.
+   *
    * @param pipelines list of pipelines configured to be triggered via Kafka
    */
   private void subscribe(Map<String, Map<String, Pipeline>> pipelines) {
@@ -133,9 +171,18 @@ class KafkaPollingAgent extends AbstractPollingAgent {
     pipelines.each { name, topics ->
       def requiredTopics = topics.keySet()
       if (requiredTopics != currentState[name]) {
-        consumers[name].subscribe(requiredTopics)
+          consumers[name].subscribe(requiredTopics)
       }
     }
+  }
+
+  // TODO (jcs) build the trigger!
+  private Pipeline buildPipelineWithContext(Pipeline pipeline, String message) {
+    Trigger trigger = Trigger.builder()
+      .type(TRIGGER_TYPE)
+      .enabled(true)
+      .build()
+    return pipeline.withTrigger(trigger)
   }
 }
 
