@@ -1,8 +1,16 @@
 spinnaker:
   cassandra:
+    enabled: false
     cluster: 'spinnaker'
     keyspace: 'echo'
   baseUrl: 'http://localhost:9000'
+
+kafkaConsumer:
+  enabled: true
+  pollingIntervalMs: 30000
+  brokers:
+    - name: kafka
+      address: 'http://localhost:3434'
 
 echo:
   baseUrl: 'http://localhost:8080'

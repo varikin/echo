@@ -35,7 +35,8 @@ public class Trigger {
     GIT("git"),
     JENKINS("jenkins"),
     DOCKER("docker"),
-    WEBHOOK("webhook");
+    WEBHOOK("webhook"),
+    KAFKA("kafka");
 
     private final String type;
 
