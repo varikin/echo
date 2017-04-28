@@ -169,9 +169,11 @@ class KafkaPollingAgent extends AbstractPollingAgent {
     }
 
     pipelines.each { name, topics ->
-      def requiredTopics = topics.keySet()
-      if (requiredTopics != currentState[name]) {
+      if (consumers[name]) {
+        def requiredTopics = topics.keySet()
+        if (requiredTopics != currentState[name]) {
           consumers[name].subscribe(requiredTopics)
+        }
       }
     }
   }
